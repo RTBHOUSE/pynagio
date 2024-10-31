@@ -47,7 +47,7 @@ class PynagioCheck(object):
         self.parser.add_argument("-R", nargs='+', dest="rate_regexes",
                                  help="Rates regex to calculate")
         self.parser.add_argument("-B", nargs='+', dest="blacklist_regexes",
-                                 help="Blacklist regexes", action="extend")
+                                 help="Blacklist regexes")
 
     def add_option(self, *args, **kwargs):
         self.parser.add_argument(*args, **kwargs)
