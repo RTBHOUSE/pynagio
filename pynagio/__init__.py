@@ -31,6 +31,7 @@ class PynagioCheck(object):
         self.critical_on = []
         self.warning_on = []
         self.unknown_on = []
+        self.rate_state = None
 
         self.parser = hacked_argument_parser.HackedArgumentParser()
         self.parser.add_argument("-t", nargs='+', dest="thresholds",
@@ -48,6 +49,15 @@ class PynagioCheck(object):
                                  help="Rates regex to calculate")
         self.parser.add_argument("-B", nargs='+', dest="blacklist_regexes",
                                  help="Blacklist regexes")
+        self.parser.add_argument("--rate-ttl", dest="rate_ttl", type=float,
+                                 default=DEFAULT_RATE_TTL,
+                                 help="Drop counters not seen for this many "
+                                      "seconds from the rate state file "
+                                      "(default: %(default)s)")
+        self.parser.add_argument("--rate-id", dest="rate_id", default=None,
+                                 help="Stable identity of this check for the "
+                                      "rate state file (default: derived "
+                                      "from argv)")
 
     def add_option(self, *args, **kwargs):
         self.parser.add_argument(*args, **kwargs)
@@ -150,17 +160,18 @@ class PynagioCheck(object):
                             threshold_regex))
                     self.exitcode = 3
 
+    def get_rate_state(self):
+        if self.rate_state is None:
+            self.rate_state = RateState(
+                rate_state_path(getattr(self.args, "rate_id", None)),
+                ttl=getattr(self.args, "rate_ttl", DEFAULT_RATE_TTL))
+        return self.rate_state
+
     def get_rate(self, label, value):
-        calculated_rate = calculate_rate(label, value)
-        if self.args.rates:
-            if label in self.args.rates and calculated_rate:
-                rate_name, rate = calculated_rate
-                return rate_name, rate
-        if self.filtered_rates:
-            if label in self.filtered_rates and calculated_rate:
-                rate_name, rate = calculated_rate
-                return rate_name, rate
-        return False
+        wanted = set(self.args.rates or []) | set(self.filtered_rates or [])
+        if label not in wanted:
+            return False
+        return self.get_rate_state().rate(label, value)
 
     def add_metrics(self, metrics):
         if not metrics:
@@ -211,6 +222,11 @@ class PynagioCheck(object):
                     if rate_value:
                         rate_name, rate = rate_value
                         self.rates[rate_name] = rate
+        if self.rate_state is not None:
+            self.rate_state.save()
+            for error in self.rate_state.errors:
+                self.unknown_on.append(error)
+                self.exitcode = 3
         if self.rates:
             metrics.update(self.rates)
         self.filter_threshold_regexes_labels(metrics.keys())
@@ -294,64 +310,111 @@ def parse_threshold_regex(threshold_regex):
     return parsed_threshold_regex
 
 
-def calculate_rate(label, value):
-    time_now = time.time()
-    value_now = {label: (value, time_now)}
+DEFAULT_RATE_TTL = 3600
+
+
+def rate_state_path(rate_id=None):
+    """Sciezka pliku stanu. Nazwa celowo identyczna jak wczesniej, zeby
+    istniejace pliki przezyly upgrade - rate_id tylko jesli podany jawnie."""
     user = getpass.getuser()
-    script_name = os.path.basename(__file__)
-    script_args = "-".join(sys.argv)
-    hashname = (hashlib.md5((user + script_name
-                             + script_args).encode('utf-8')).hexdigest())
+    if rate_id is None:
+        script_name = os.path.basename(__file__)
+        script_args = "-".join(sys.argv)
+        rate_id = script_name + script_args
+    hashname = hashlib.md5((user + rate_id).encode('utf-8')).hexdigest()
     if user == "root":
         rate_dir = "/var/run"
-        rate_filename = "{}/nagios-{}".format(rate_dir, hashname)
     else:
         rate_dir = "/tmp"
-        rate_filename = "{}/nagios-{}".format(rate_dir, hashname)
-    if os.path.exists(rate_filename):
+    return "{}/nagios-{}".format(rate_dir, hashname)
+
+
+class RateState(object):
+    """Stan licznikow dla rate'ow: jeden odczyt i jeden zapis na przebieg,
+    z wygasaniem wpisow, ktorych juz nie widzimy (efemeryczne veth)."""
+
+    def __init__(self, path, ttl=DEFAULT_RATE_TTL):
+        self.path = path
+        self.ttl = ttl
+        self.previous = {}
+        self.current = {}
+        self.errors = []
+        self._loaded = False
+
+    def load(self):
+        if self._loaded:
+            return
+        self._loaded = True
         try:
-            with open(rate_filename, "r+") as ratefile:
-                values_from_file = json.load(ratefile)
-                if label in values_from_file:
-                    delta = value - values_from_file[label][0]
-                    time_delta = time_now - values_from_file[label][1]
-                    rate = delta / time_delta
-                    rate_name = label + "_rate"
-                    values_from_file[label] = (value, time_now)
-                    with open(rate_filename, "w+") as ratefile:
-                        json.dump(values_from_file, ratefile,
-                                  ensure_ascii=False, sort_keys=True,
-                                  indent=4)
-                    return (rate_name, rate)
-                else:
-                    values_from_file.update(value_now)
-                    with open(rate_filename, "w+") as ratefile:
-                        json.dump(values_from_file, ratefile,
-                                  ensure_ascii=False, sort_keys=True,
-                                  indent=4)
-        except Exception as exc:
-            print(str(exc))
-            try:
-                with open(rate_filename, "w+") as ratefile:
-                    json.dump(value_now, ratefile, ensure_ascii=False,
-                              sort_keys=True, indent=4)
-            except IOError as ioe:
-                print("Cannot write to the rate file {}".format(rate_filename))
-                print(str(ioe))
-                sys.exit(2)
+            with open(self.path) as statefile:
+                data = json.load(statefile)
+        except (IOError, OSError):
+            data = {}
+        except ValueError as exc:
+            self.errors.append(
+                "rate file {} unreadable ({}), reseeding".format(
+                    self.path, exc))
+            data = {}
+        self.previous = data if isinstance(data, dict) else {}
+
+    def rate(self, label, value, now=None):
+        """Zwraca (nazwa, rate) albo False - jak stare calculate_rate()."""
+        self.load()
+        if now is None:
+            now = time.time()
+        self.current[label] = (value, now)
+        previous = self.previous.get(label)
+        if not previous:
             return False
-    else:
         try:
-            with open(rate_filename, "w+") as ratefile:
-                time_now = time.time()
-                value_now = {label: (value, time_now)}
-                json.dump(value_now, ratefile, ensure_ascii=False,
-                          sort_keys=True, indent=4)
-        except IOError as ioe:
-            print("Cannot create rate file in {}".format(rate_dir))
-            print(str(ioe))
-            sys.exit(2)
-        return False
+            previous_value = float(previous[0])
+            previous_time = float(previous[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            return False
+        time_delta = now - previous_time
+        if time_delta <= 0:
+            return False
+        delta = value - previous_value
+        if delta < 0:
+            # licznik wyzerowany albo interfejs odtworzony pod ta sama nazwa
+            return False
+        return (label + "_rate", delta / time_delta)
+
+    def save(self):
+        """Zapis atomowy. Wpisy niewidziane w tym przebiegu wygasaja po ttl."""
+        self.load()
+        cutoff = time.time() - self.ttl
+        merged = {}
+        for label, entry in self.previous.items():
+            try:
+                if float(entry[1]) >= cutoff:
+                    merged[label] = entry
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+        merged.update(self.current)
+        tmpname = "{}.{}.tmp".format(self.path, os.getpid())
+        try:
+            with open(tmpname, "w") as statefile:
+                json.dump(merged, statefile, separators=(",", ":"))
+                statefile.flush()
+                os.fsync(statefile.fileno())
+            os.rename(tmpname, self.path)
+        except (IOError, OSError) as exc:
+            try:
+                os.unlink(tmpname)
+            except OSError:
+                pass
+            self.errors.append(
+                "cannot write rate file {}: {}".format(self.path, exc))
+
+
+def calculate_rate(label, value):
+    """Zgodnosc wsteczna: pojedynczy odczyt/zapis. Wewnatrz PynagioCheck
+    uzywany jest RateState, ktory robi jedno IO na caly przebieg."""
+    state = RateState(rate_state_path())
+    result = state.rate(label, value)
+    state.save()
+    return result
 
 
 def match_label(regexes, label):
